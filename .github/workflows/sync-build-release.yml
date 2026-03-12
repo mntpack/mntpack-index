@@ -1,0 +1,155 @@
+name: Sync Build Release
+
+on:
+  repository_dispatch:
+    types: [mntpack_sync]
+  workflow_dispatch:
+    inputs:
+      owner:
+        description: GitHub repository owner
+        required: true
+        type: string
+      repo:
+        description: GitHub repository name
+        required: true
+        type: string
+      version:
+        description: Optional tag/branch/commit for sync
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  sync-build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout index repo
+        uses: actions/checkout@v4
+
+      - name: Resolve payload
+        id: payload
+        env:
+          INPUT_OWNER: ${{ github.event.client_payload.owner || github.event.inputs.owner }}
+          INPUT_REPO: ${{ github.event.client_payload.repo || github.event.inputs.repo }}
+          INPUT_VERSION: ${{ github.event.client_payload.requested_version || github.event.inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          OWNER="${INPUT_OWNER:-}"
+          REPO="${INPUT_REPO:-}"
+          VERSION="${INPUT_VERSION:-}"
+          if [[ -z "$OWNER" || -z "$REPO" ]]; then
+            echo "owner/repo must be provided"
+            exit 1
+          fi
+          echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq xz-utils pkg-config libssl-dev
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Checkout mntpack source
+        uses: actions/checkout@v4
+        with:
+          repository: mntpack/mntpack
+          path: mntpack-src
+
+      - name: Install mntpack if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          if ! command -v mntpack >/dev/null 2>&1; then
+            cargo install --path mntpack-src --force
+          fi
+
+      - name: Configure mntpack home
+        shell: bash
+        run: |
+          echo "MNTPACK_HOME=$RUNNER_TEMP/.mntpack" >> "$GITHUB_ENV"
+
+      - name: Sync repository using mntpack
+        env:
+          OWNER: ${{ steps.payload.outputs.owner }}
+          REPO: ${{ steps.payload.outputs.repo }}
+          VERSION: ${{ steps.payload.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "$VERSION" ]]; then
+            mntpack sync "$OWNER/$REPO" -v "$VERSION"
+          else
+            mntpack sync "$OWNER/$REPO"
+          fi
+
+      - name: Package binary
+        id: package
+        env:
+          OWNER: ${{ steps.payload.outputs.owner }}
+          REPO: ${{ steps.payload.outputs.repo }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          INSTALL_JSON=""
+          for file in "$MNTPACK_HOME"/packages/*/install.json; do
+            [[ -f "$file" ]] || continue
+            rec_owner=$(jq -r '.owner // empty' "$file")
+            rec_repo=$(jq -r '.repo // empty' "$file")
+            if [[ "$rec_owner" == "$OWNER" && "$rec_repo" == "$REPO" ]]; then
+              INSTALL_JSON="$file"
+              break
+            fi
+          done
+
+          if [[ -z "$INSTALL_JSON" ]]; then
+            echo "failed to locate install metadata for $OWNER/$REPO"
+            exit 1
+          fi
+
+          BIN_PATH=$(jq -r '.binaryPath // empty' "$INSTALL_JSON")
+          if [[ -z "$BIN_PATH" ]]; then
+            BIN_HASH=$(jq -r '.binaryHash // empty' "$INSTALL_JSON")
+            BIN_NAME=$(jq -r '.binaryName // empty' "$INSTALL_JSON")
+            if [[ -n "$BIN_HASH" && -n "$BIN_NAME" ]]; then
+              CLEAN_HASH="${BIN_HASH#sha256:}"
+              BIN_PATH="$MNTPACK_HOME/store/sha256/$CLEAN_HASH/$BIN_NAME"
+            fi
+          fi
+
+          if [[ -z "$BIN_PATH" || ! -f "$BIN_PATH" ]]; then
+            echo "binary not found for $OWNER/$REPO (command-driven package or build pending)"
+            exit 1
+          fi
+
+          REF=$(jq -r '.commit // .version // "latest"' "$INSTALL_JSON")
+          SAFE_REF=$(echo "$REF" | tr '/: ' '---' | tr -cd '[:alnum:]._-')
+          SAFE_OWNER=$(echo "$OWNER" | tr '/: ' '---' | tr -cd '[:alnum:]._-')
+          SAFE_REPO=$(echo "$REPO" | tr '/: ' '---' | tr -cd '[:alnum:]._-')
+          TAG="${SAFE_OWNER}-${SAFE_REPO}-${SAFE_REF}"
+          ASSET="mntpack-${SAFE_OWNER}-${SAFE_REPO}-${SAFE_REF}-linux-x64.tar.xz"
+
+          mkdir -p out
+          cp "$BIN_PATH" "out/$(basename "$BIN_PATH")"
+          tar -C out -cJf "$ASSET" "$(basename "$BIN_PATH")"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.package.outputs.tag }}
+          name: ${{ steps.package.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          overwrite_files: true
+          files: |
+            ${{ steps.package.outputs.asset }}
