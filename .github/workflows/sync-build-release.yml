@@ -14,7 +14,11 @@ on:
         required: true
         type: string
       version:
-        description: Optional tag/branch/commit for sync
+        description: Optional tag/commit for sync
+        required: false
+        type: string
+      package_name:
+        description: Optional package name override
         required: false
         type: string
 
@@ -22,36 +26,48 @@ permissions:
   contents: write
 
 jobs:
-  sync-build-release:
-    runs-on: ubuntu-latest
+  build:
+    name: build-${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+            ext: tar.xz
+          - os: windows-latest
+            target: windows-x64
+            ext: zip
     steps:
       - name: Checkout index repo
         uses: actions/checkout@v4
 
       - name: Resolve payload
         id: payload
-        env:
-          INPUT_OWNER: ${{ github.event.client_payload.owner || github.event.inputs.owner }}
-          INPUT_REPO: ${{ github.event.client_payload.repo || github.event.inputs.repo }}
-          INPUT_VERSION: ${{ github.event.client_payload.requested_version || github.event.inputs.version }}
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          OWNER="${INPUT_OWNER:-}"
-          REPO="${INPUT_REPO:-}"
-          VERSION="${INPUT_VERSION:-}"
-          if [[ -z "$OWNER" || -z "$REPO" ]]; then
-            echo "owner/repo must be provided"
-            exit 1
-          fi
-          echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
-          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          $owner = "${{ github.event.client_payload.owner }}"
+          if ([string]::IsNullOrWhiteSpace($owner)) { $owner = "${{ inputs.owner }}" }
+          $repo = "${{ github.event.client_payload.repo }}"
+          if ([string]::IsNullOrWhiteSpace($repo)) { $repo = "${{ inputs.repo }}" }
+          if ([string]::IsNullOrWhiteSpace($owner) -or [string]::IsNullOrWhiteSpace($repo)) {
+            throw "owner/repo must be provided"
+          }
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq xz-utils pkg-config libssl-dev
+          $version = "${{ github.event.client_payload.requested_version }}"
+          if ([string]::IsNullOrWhiteSpace($version)) { $version = "${{ github.event.client_payload.resolved_version }}" }
+          if ([string]::IsNullOrWhiteSpace($version)) { $version = "${{ github.event.client_payload.commit }}" }
+          if ([string]::IsNullOrWhiteSpace($version)) { $version = "${{ inputs.version }}" }
+
+          $packageName = "${{ github.event.client_payload.package_name }}"
+          if ([string]::IsNullOrWhiteSpace($packageName)) { $packageName = "${{ inputs.package_name }}" }
+          if ([string]::IsNullOrWhiteSpace($packageName)) { $packageName = $repo }
+
+          "owner=$owner" >> $env:GITHUB_OUTPUT
+          "repo=$repo" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "package_name=$packageName" >> $env:GITHUB_OUTPUT
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -62,94 +78,144 @@ jobs:
           repository: mntpack/mntpack
           path: mntpack-src
 
-      - name: Install mntpack if missing
-        shell: bash
+      - name: Build mntpack
+        shell: pwsh
         run: |
-          set -euo pipefail
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          if ! command -v mntpack >/dev/null 2>&1; then
-            cargo install --path mntpack-src --force
-          fi
+          cargo build --release --manifest-path mntpack-src/Cargo.toml
 
       - name: Configure mntpack home
-        shell: bash
+        shell: pwsh
         run: |
-          echo "MNTPACK_HOME=$RUNNER_TEMP/.mntpack" >> "$GITHUB_ENV"
+          $mntpackHome = Join-Path $env:RUNNER_TEMP ".mntpack"
+          "MNTPACK_HOME=$mntpackHome" >> $env:GITHUB_ENV
 
       - name: Sync repository using mntpack
+        id: sync
         env:
           OWNER: ${{ steps.payload.outputs.owner }}
           REPO: ${{ steps.payload.outputs.repo }}
           VERSION: ${{ steps.payload.outputs.version }}
-        shell: bash
+          PACKAGE_NAME: ${{ steps.payload.outputs.package_name }}
+        shell: pwsh
         run: |
-          set -euo pipefail
-          if [[ -n "$VERSION" ]]; then
-            mntpack sync "$OWNER/$REPO" -v "$VERSION"
-          else
-            mntpack sync "$OWNER/$REPO"
-          fi
+          $exe = if ($env:RUNNER_OS -eq "Windows") { "mntpack.exe" } else { "mntpack" }
+          $mntpack = Join-Path (Resolve-Path "mntpack-src/target/release") $exe
+          if (-not (Test-Path $mntpack)) {
+            throw "mntpack binary not found at $mntpack"
+          }
+          $repoSpec = "$env:OWNER/$env:REPO"
+          if ([string]::IsNullOrWhiteSpace($env:VERSION)) {
+            & $mntpack sync $repoSpec -n $env:PACKAGE_NAME
+          } else {
+            & $mntpack sync $repoSpec -n $env:PACKAGE_NAME -v $env:VERSION
+          }
+          if ($LASTEXITCODE -ne 0) {
+            throw "mntpack sync failed with exit code $LASTEXITCODE"
+          }
 
       - name: Package binary
         id: package
         env:
           OWNER: ${{ steps.payload.outputs.owner }}
           REPO: ${{ steps.payload.outputs.repo }}
+          PACKAGE_NAME: ${{ steps.payload.outputs.package_name }}
+          TARGET: ${{ matrix.target }}
+          EXT: ${{ matrix.ext }}
+        shell: pwsh
+        run: |
+          $installJson = $null
+          $packageRoot = Join-Path $env:MNTPACK_HOME "packages"
+          if (Test-Path $packageRoot) {
+            foreach ($file in Get-ChildItem -Path $packageRoot -Filter install.json -Recurse -File) {
+              $record = Get-Content -Raw $file.FullName | ConvertFrom-Json
+              if ($record.owner -eq $env:OWNER -and $record.repo -eq $env:REPO) {
+                $installJson = $file.FullName
+                break
+              }
+            }
+          }
+
+          if ([string]::IsNullOrWhiteSpace($installJson)) {
+            throw "failed to locate install metadata for $env:OWNER/$env:REPO"
+          }
+
+          $record = Get-Content -Raw $installJson | ConvertFrom-Json
+          $binaryPath = "$($record.binaryPath)"
+          if ([string]::IsNullOrWhiteSpace($binaryPath)) {
+            $binaryHash = "$($record.binaryHash)"
+            $binaryName = "$($record.binaryName)"
+            if (-not [string]::IsNullOrWhiteSpace($binaryHash) -and -not [string]::IsNullOrWhiteSpace($binaryName)) {
+              $cleanHash = $binaryHash -replace '^sha256:', ''
+              $binaryPath = Join-Path $env:MNTPACK_HOME "store/sha256/$cleanHash/$binaryName"
+            }
+          }
+
+          if ([string]::IsNullOrWhiteSpace($binaryPath) -or -not (Test-Path $binaryPath)) {
+            throw "binary not found for $env:OWNER/$env:REPO (command-driven package or build pending)"
+          }
+
+          $ref = "$($record.commit)"
+          if ([string]::IsNullOrWhiteSpace($ref)) { $ref = "$($record.version)" }
+          if ([string]::IsNullOrWhiteSpace($ref)) { $ref = "latest" }
+          $safeRef = ($ref -replace '[^A-Za-z0-9._-]', '-')
+          $safeOwner = ($env:OWNER -replace '[^A-Za-z0-9._-]', '-')
+          $safeRepo = ($env:REPO -replace '[^A-Za-z0-9._-]', '-')
+          $tag = "$safeOwner-$safeRepo-$safeRef"
+          $asset = "mntpack-$safeOwner-$safeRepo-$safeRef-$env:TARGET.$env:EXT"
+
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          if ($env:RUNNER_OS -eq "Windows") {
+            Compress-Archive -Path $binaryPath -DestinationPath (Join-Path dist $asset) -Force
+          } else {
+            $binDir = Split-Path -Parent $binaryPath
+            $binName = Split-Path -Leaf $binaryPath
+            tar -cJf (Join-Path dist $asset) -C $binDir $binName
+          }
+          Set-Content -Path (Join-Path dist "release-tag-${env:TARGET}.txt") -Value $tag -NoNewline
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-build-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish-release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sync-build-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Resolve release tag
+        id: release_tag
         shell: bash
         run: |
           set -euo pipefail
-          INSTALL_JSON=""
-          for file in "$MNTPACK_HOME"/packages/*/install.json; do
-            [[ -f "$file" ]] || continue
-            rec_owner=$(jq -r '.owner // empty' "$file")
-            rec_repo=$(jq -r '.repo // empty' "$file")
-            if [[ "$rec_owner" == "$OWNER" && "$rec_repo" == "$REPO" ]]; then
-              INSTALL_JSON="$file"
-              break
-            fi
-          done
-
-          if [[ -z "$INSTALL_JSON" ]]; then
-            echo "failed to locate install metadata for $OWNER/$REPO"
+          mapfile -t TAGS < <(cat release-assets/release-tag-*.txt | sort -u)
+          if [[ "${#TAGS[@]}" -eq 0 ]]; then
+            echo "no release tag files found"
             exit 1
           fi
-
-          BIN_PATH=$(jq -r '.binaryPath // empty' "$INSTALL_JSON")
-          if [[ -z "$BIN_PATH" ]]; then
-            BIN_HASH=$(jq -r '.binaryHash // empty' "$INSTALL_JSON")
-            BIN_NAME=$(jq -r '.binaryName // empty' "$INSTALL_JSON")
-            if [[ -n "$BIN_HASH" && -n "$BIN_NAME" ]]; then
-              CLEAN_HASH="${BIN_HASH#sha256:}"
-              BIN_PATH="$MNTPACK_HOME/store/sha256/$CLEAN_HASH/$BIN_NAME"
-            fi
-          fi
-
-          if [[ -z "$BIN_PATH" || ! -f "$BIN_PATH" ]]; then
-            echo "binary not found for $OWNER/$REPO (command-driven package or build pending)"
+          if [[ "${#TAGS[@]}" -ne 1 ]]; then
+            echo "mismatched release tags from matrix runs:"
+            printf ' - %s\n' "${TAGS[@]}"
             exit 1
           fi
-
-          REF=$(jq -r '.commit // .version // "latest"' "$INSTALL_JSON")
-          SAFE_REF=$(echo "$REF" | tr '/: ' '---' | tr -cd '[:alnum:]._-')
-          SAFE_OWNER=$(echo "$OWNER" | tr '/: ' '---' | tr -cd '[:alnum:]._-')
-          SAFE_REPO=$(echo "$REPO" | tr '/: ' '---' | tr -cd '[:alnum:]._-')
-          TAG="${SAFE_OWNER}-${SAFE_REPO}-${SAFE_REF}"
-          ASSET="mntpack-${SAFE_OWNER}-${SAFE_REPO}-${SAFE_REF}-linux-x64.tar.xz"
-
-          mkdir -p out
-          cp "$BIN_PATH" "out/$(basename "$BIN_PATH")"
-          tar -C out -cJf "$ASSET" "$(basename "$BIN_PATH")"
-
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAGS[0]}" >> "$GITHUB_OUTPUT"
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.package.outputs.tag }}
-          name: ${{ steps.package.outputs.tag }}
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          name: ${{ steps.release_tag.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          generate_release_notes: true
           overwrite_files: true
           files: |
-            ${{ steps.package.outputs.asset }}
+            release-assets/*.tar.xz
+            release-assets/*.zip
